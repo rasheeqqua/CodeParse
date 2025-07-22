@@ -1,6 +1,3 @@
-/**
- * Triggers a client-side download of an arbitrary Blob.
- */
 export function downloadBlob(blob: Blob, filename: string) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

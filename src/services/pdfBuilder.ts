@@ -1,62 +1,95 @@
+import { jsPDF } from 'jspdf';
 import { type FileEntry } from '../types';
-import { PDFDocument, rgb } from 'pdf-lib';
 
 /**
- * Path to a mono-spaced Unicode font placed in /public/fonts
- * (any TTF/OTF with a permissive licence will work).
+ * IMPORTANT: a Unicode-capable monospace font (e.g. JetBrains Mono) must
+ * exist in /public/fonts.  Download the .ttf once and drop it there:
+ *
+ *   public/fonts/JetBrainsMono-Regular.ttf
+ *
+ * Any font with an open licence will work.
  */
-const FONT_URL = '../../public/fonts/JetBrainsMono-Regular.ttf';
+const FONT_URL = '/fonts/JetBrainsMono-Regular.ttf';
+
+/** convert ArrayBuffer → base-64 string required by jsPDF.addFileToVFS */
+function bufToB64(buf: ArrayBuffer): string {
+    let binary = '';
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+
+/** Hard-wrap one logical line into N visual lines */
+function hardWrap(line: string, maxChars: number): string[] {
+    if (line.length <= maxChars) return [line];
+    const out: string[] = [];
+    for (let i = 0; i < line.length; i += maxChars) {
+        out.push(line.slice(i, i + maxChars));
+    }
+    return out;
+}
 
 /**
- * Creates a single selectable PDF that contains the entire code-base.
- * Handles full-Unicode input by embedding JetBrains Mono.
+ * Build a full-Unicode, selectable PDF with jsPDF.
+ * Returns a Blob ready for download.
  */
 export async function buildPdf(files: FileEntry[]): Promise<Blob> {
-    // ─── prepare document & font ──────────────────────────────────────────
-    const pdfDoc = await PDFDocument.create();
+    /* ── 1. prepare document & embed font ────────────────────────────── */
+    const doc = new jsPDF({ unit: 'pt', format: 'a4' }); // pt = PostScript points
     const fontBytes = await fetch(FONT_URL).then((r) => r.arrayBuffer());
-    const mono = await pdfDoc.embedFont(fontBytes, { subset: true }); // Unicode-capable!
+    doc.addFileToVFS('JetBrainsMono-Regular.ttf', bufToB64(fontBytes));
+    doc.addFont('JetBrainsMono-Regular.ttf', 'JetBrainsMono', 'normal');
+    doc.setFont('JetBrainsMono', 'normal');
 
-    // ─── layout constants ────────────────────────────────────────────────
-    const fontSizeHeader = 10;
-    const fontSizeCode = 8;
-    const lineHeightHeader = fontSizeHeader * 1.4;
-    const lineHeightCode = fontSizeCode * 1.2;
+    /* ── 2. layout constants ─────────────────────────────────────────── */
     const margin = 40;
+    const headerSize = 10;
+    const codeSize = 8;
+    const headerLH = headerSize * 1.4;
+    const codeLH = codeSize * 1.2;
+    const pageW = doc.internal.pageSize.getWidth();
+    const pageH = doc.internal.pageSize.getHeight();
+    const effectiveW = pageW - margin * 2;
+    let y = margin;
 
-    let page = pdfDoc.addPage();
-    const { width: pageW, height: pageH } = page.getSize();
-    let cursorY = pageH - margin;
-
-    // header on first page
-    drawHeader(page, mono, fontSizeHeader, margin, cursorY);
-    cursorY -= lineHeightHeader;
-
-    // compute wrap width
-    const charW = mono.widthOfTextAtSize('M', fontSizeCode);
-    const maxCharsPerLine = Math.floor((pageW - margin * 2) / charW);
-
-    const newPage = () => {
-        page = pdfDoc.addPage();
-        drawHeader(page, mono, fontSizeHeader, margin, pageH - margin);
-        cursorY = pageH - margin - lineHeightHeader;
+    const printHeader = () => {
+        doc.setFontSize(headerSize);
+        doc.text(
+            `Codebase Export – ${new Date().toLocaleDateString()}`,
+            margin,
+            y,
+        );
+        y += headerLH;
     };
 
-    // ─── iterate over every file ─────────────────────────────────────────
+    printHeader(); // first page header
+    doc.setFontSize(codeSize);
+
+    /* ── 3. pre-compute wrap width in characters (monospace!) ────────── */
+    const charW = doc.getTextWidth('M'); // width of one monospace glyph
+    const maxCharsPerLine = Math.floor(effectiveW / charW);
+
+    const ensureSpace = (needed: number) => {
+        if (y + needed > pageH - margin) {
+            doc.addPage();
+            y = margin;
+            printHeader();
+            doc.setFontSize(codeSize);
+        }
+    };
+
+    /* ── 4. iterate through every selected file ──────────────────────── */
     for (const file of files) {
-        // room for file header?
-        if (cursorY - lineHeightHeader < margin) newPage();
+        /* file header */
+        ensureSpace(headerLH);
+        doc.setFontSize(headerSize);
+        doc.text(file.path, margin, y);
+        y += headerLH;
+        doc.setFontSize(codeSize);
 
-        page.drawText(file.path, {
-            x: margin,
-            y: cursorY,
-            size: fontSizeHeader,
-            font: mono,
-            color: rgb(0, 0, 0),
-        });
-        cursorY -= lineHeightHeader;
-
-        // read file text (catch keeps pipeline alive even if one read fails)
+        /* file content */
         const raw = await file
             .getText()
             .catch(
@@ -64,51 +97,21 @@ export async function buildPdf(files: FileEntry[]): Promise<Blob> {
                     `[Error reading file: ${e instanceof Error ? e.message : String(e)}]`,
             );
 
-        for (const logicalLine of raw.split(/\r?\n/)) {
-            const wrapped = hardWrap(logicalLine === '' ? ' ' : logicalLine, maxCharsPerLine);
-            for (const vis of wrapped) {
-                if (cursorY - lineHeightCode < margin) newPage();
-                page.drawText(vis, {
-                    x: margin,
-                    y: cursorY,
-                    size: fontSizeCode,
-                    font: mono,
-                    color: rgb(0, 0, 0),
-                });
-                cursorY -= lineHeightCode;
+        for (const logical of raw.split(/\r?\n/)) {
+            const visualLines = hardWrap(
+                logical === '' ? ' ' : logical,
+                maxCharsPerLine,
+            );
+
+            for (const vis of visualLines) {
+                ensureSpace(codeLH);
+                doc.text(vis, margin, y);
+                y += codeLH;
             }
         }
-        cursorY -= lineHeightCode; // extra gap between files
+        y += codeLH; // gap between files
     }
 
-    // ─── finalise ────────────────────────────────────────────────────────
-    const bytes = await pdfDoc.save();
-    return new Blob([bytes], { type: 'application/pdf' });
-}
-
-/* ───────────────────────── helpers ───────────────────────── */
-
-function hardWrap(text: string, width: number): string[] {
-    if (text.length <= width) return [text];
-    const out: string[] = [];
-    for (let i = 0; i < text.length; i += width) {
-        out.push(text.slice(i, i + width));
-    }
-    return out;
-}
-
-function drawHeader(
-    page: import('pdf-lib').PDFPage,
-    font: import('pdf-lib').PDFFont,
-    size: number,
-    x: number,
-    y: number,
-) {
-    page.drawText(`Codebase Export – ${new Date().toLocaleDateString()}`, {
-        x,
-        y,
-        size,
-        font,
-        color: rgb(0, 0, 0),
-    });
+    /* ── 5. done ─────────────────────────────────────────────────────── */
+    return doc.output('blob');
 }
