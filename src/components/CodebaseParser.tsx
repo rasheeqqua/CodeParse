@@ -1,109 +1,133 @@
-import React, { useCallback, useState } from 'react';
-import { Download, Upload, FileText, AlertCircle, CheckCircle2, File } from 'lucide-react';
-
+import React, { useCallback, useMemo, useState, type ChangeEventHandler } from 'react';
+import { Download, Upload, FileText, AlertCircle, CheckCircle2 } from 'lucide-react';
+import ignore from 'ignore';
 import { buildTxt } from '../services/txtBuilder';
 import { buildPdf } from '../services/pdfBuilder';
 import { downloadBlob } from '../utils/download';
+import { isCodeFile } from '../utils/fileFilters';
+import { buildTree, type TreeNode } from '../utils/treeBuilder';
+import FileTree from './FileTree';
 import { type FileEntry } from '../types';
+import { formatFileSize } from "../utils/format";
 
 interface UploadedFile {
-    /** Native File object */
-    file: File;
-    /** Relative path within the folder upload */
+    fle: File;
     path: string;
     size: number;
 }
 
-const MAX_SIZE = 50 * 1024 * 1024; // 50 MB
+/* 50 MB limit applied AFTER filtering / selection */
+const MAX_EXPORT_SIZE = 50 * 1024 * 1024;
 
 const CodebaseParser: React.FC = () => {
     const [files, setFiles] = useState<UploadedFile[]>([]);
     const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
-    const [isProcessing, setIsProcessing] = useState(false);
+    const [gitignoreApplied, setGitignoreApplied] = useState(false);
 
+    const [isProcessing, setIsProcessing] = useState(false);
     const [txtBlob, setTxtBlob] = useState<Blob | null>(null);
     const [pdfBlob, setPdfBlob] = useState<Blob | null>(null);
     const [txtPreview, setTxtPreview] = useState<string>('');
 
-    /* ────────────────────────── helpers ────────────────────────── */
-    const formatFileSize = (bytes: number) => {
-        if (bytes === 0) return '0 Bytes';
-        const k = 1024;
-        const units = ['Bytes', 'KB', 'MB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return `${(bytes / Math.pow(k, i)).toFixed(2)} ${units[i]}`;
-    };
+    /* ───────────────────────── helpers ───────────────────────── */
+    const getSelectedSize = () =>
+        files
+            .filter((f) => selectedFiles.has(f.path))
+            .reduce((sum, f) => sum + f.size, 0);
 
-    const isCodeFile = (fileName: string) => {
-        const codeExtensions = ['.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
-            '.cs', '.php', '.rb', '.go', '.rs', '.swift','.kt', '.scala', '.r', '.sql', '.html', '.css', '.scss',
-            '.sass', '.less', '.json', '.xml', '.yaml', '.yml', '.md', '.txt', '.sh', '.bat', '.ps1', '.dockerfile',
-            '.gitignore', '.env', '.config', '.ini', '.conf', '.lock'
-        ];
-        return (
-            codeExtensions.some((ext) => fileName.toLowerCase().endsWith(ext)) ||
-            !fileName.includes('.') // files like "Dockerfile", "Makefile"
-        );
-    };
+    const exportTooLarge = getSelectedSize() > MAX_EXPORT_SIZE;
 
-    /* ─────────────────────── folder upload ─────────────────────── */
-    const handleFolderUpload: React.ChangeEventHandler<HTMLInputElement> =
-        useCallback((e) => {
-            const fileList = Array.from(e.target.files ?? []);
-            if (!fileList.length) return;
+    /* ─────────────────── folder upload & filtering ────────────── */
+    const scanFolder = useCallback(
+        async (fileList: FileList): Promise<UploadedFile[]> => {
+            const arr = Array.from(fileList);
 
-            let total = 0;
+            /* Detect root folder name (first segment before the slash) */
+            const firstFile = arr[0] as File & { webkitRelativePath?: string };
+            const firstPath = firstFile.webkitRelativePath ?? '';
+            const baseDir = firstPath ? firstPath.split('/')[0] : '';
+
+            /* Read every .gitignore we find */
+            const igFileCandidates = arr.filter((f) => f.name === '.gitignore');
+            let ig: ReturnType<typeof ignore> | null = null;
+            if (igFileCandidates.length) {
+                ig = ignore();
+                for (const f of igFileCandidates) {
+                    ig.add(await f.text());
+                }
+            }
+            setGitignoreApplied(Boolean(ig));
+
+            /* Build cleaned list */
             const clean: UploadedFile[] = [];
 
-            fileList.forEach((f) => {
-                if (isCodeFile(f.name)) {
-                    total += f.size;
-                    clean.push({
-                        file: f,
-                        path: (f as any).webkitRelativePath || f.name,
-                        size: f.size,
-                    });
-                }
-            });
+            for (const file of arr) {
+                const f = file as File & { webkitRelativePath?: string };
 
-            if (total > MAX_SIZE) {
-                alert(
-                    `Total size (${formatFileSize(
-                        total,
-                    )}) exceeds 50 MB. Please select a smaller subset.`,
-                );
-                return;
+                const originalPath = f.webkitRelativePath ?? f.name;
+                const normalized = originalPath.replaceAll('\\', '/');
+
+                /* Path relative to project root (for ignore matching) */
+                const relPath = baseDir
+                    ? normalized.split('/').slice(1).join('/')
+                    : normalized;
+
+                if (ig?.ignores(relPath)) continue;      // .gitignore exclusion
+                if (!isCodeFile(f.name)) continue;       // fallback extension filter
+
+                clean.push({ fle: f, path: normalized, size: f.size });
             }
+
+            /* Sort for nicer UI */
+            clean.sort((a, b) => a.path.localeCompare(b.path));
+            return clean;
+        },
+        [],
+    );
+
+    const handleFolderUpload: ChangeEventHandler<HTMLInputElement> = useCallback(
+        async (e) => {
+            const fl = e.target.files;
+            if (!fl || fl.length === 0) return;
+
+            const clean = await scanFolder(fl);
 
             setFiles(clean);
             setSelectedFiles(new Set(clean.map((f) => f.path)));
             setTxtBlob(null);
             setPdfBlob(null);
             setTxtPreview('');
-        }, []);
+        },
+        [scanFolder],
+    );
 
-    /* ─────────────────────── selection toggles ─────────────────────── */
+    /* ───────────────────── selection helpers ──────────────────── */
     const toggleFile = (path: string) => {
-        const newSet = new Set(selectedFiles);
-        if (newSet.has(path)) newSet.delete(path);
-        else newSet.add(path);
-        setSelectedFiles(newSet);
+        setSelectedFiles((prev) => {
+            const next = new Set(prev);
+            if (next.has(path)) next.delete(path);
+            else next.add(path);
+            return next;
+        });
+    };
+
+    const toggleFolder = (paths: string[], select: boolean) => {
+        setSelectedFiles((prev) => {
+            const next = new Set(prev);
+            paths.forEach((p) => {
+                if (select) next.add(p);
+                else next.delete(p);
+            });
+            return next;
+        });
     };
 
     const selectAll = () => setSelectedFiles(new Set(files.map((f) => f.path)));
     const deselectAll = () => setSelectedFiles(new Set());
 
-    const getSelectedSize = () =>
-        files
-            .filter((f) => selectedFiles.has(f.path))
-            .reduce((sum, f) => sum + f.size, 0);
-
-    /* ─────────────────────── generators ─────────────────────── */
+    /* ───────────────────────── documents ──────────────────────── */
     const generateDocuments = async () => {
-        if (selectedFiles.size === 0) {
-            alert('Please select at least one file.');
-            return;
-        }
+        if (exportTooLarge || selectedFiles.size === 0) return;
 
         setIsProcessing(true);
 
@@ -112,22 +136,25 @@ const CodebaseParser: React.FC = () => {
             .map((f) => ({
                 path: f.path,
                 size: f.size,
-                getText: () => f.file.text(),
+                getText: () => f.fle.text(),
             }));
 
-        // Build TXT first (gives us preview text)
+        /* TXT first – quick and gives preview */
         const { blob: txtB, text } = await buildTxt(entries);
         setTxtBlob(txtB);
         setTxtPreview(text);
 
-        // Build PDF (takes longer)
+        /* Then PDF */
         const pdfB = await buildPdf(entries);
         setPdfBlob(pdfB);
 
         setIsProcessing(false);
     };
 
-    /* ───────────────────────── UI start ───────────────────────── */
+    /* ───────────────────────── derived data ───────────────────── */
+    const tree: TreeNode[] = useMemo(() => buildTree(files), [files]);
+
+    /* ───────────────────────────── UI ─────────────────────────── */
     return (
         <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-6">
             <div className="max-w-6xl mx-auto">
@@ -140,17 +167,19 @@ const CodebaseParser: React.FC = () => {
                     </p>
                 </header>
 
-                {/* ───── Upload section ───── */}
+                {/* ─────────── Upload ─────────── */}
                 <section className="bg-white rounded-xl shadow-lg p-8 mb-8">
                     <div className="border-2 border-dashed border-blue-300 rounded-lg p-8 text-center hover:border-blue-400 transition-colors">
                         <Upload className="mx-auto h-16 w-16 text-blue-400 mb-4" />
                         <h3 className="text-xl font-semibold text-gray-700 mb-2">
                             Upload Your Project Folder
                         </h3>
-                        <p className="text-gray-500 mb-4">Maximum size: 50 MB</p>
+                        <p className="text-gray-500 mb-4">
+                            Export size limit: 50 MB (enforced after filtering)
+                        </p>
                         <input
                             type="file"
-                            /* @ts-ignore – non-standard attribute for folder upload */
+                            /* @ts-expect-error – non-standard attribute for folder upload */
                             webkitdirectory=""
                             directory=""
                             multiple
@@ -167,7 +196,7 @@ const CodebaseParser: React.FC = () => {
                     </div>
                 </section>
 
-                {/* ───── File selection list ───── */}
+                {/* ─────────── File tree & selection ─────────── */}
                 {files.length > 0 && (
                     <section className="bg-white rounded-xl shadow-lg p-8 mb-8">
                         <header className="flex justify-between items-center mb-6">
@@ -190,6 +219,7 @@ const CodebaseParser: React.FC = () => {
                             </div>
                         </header>
 
+                        {/* Selection summary */}
                         <div className="mb-6 p-4 bg-blue-50 rounded-lg">
                             <div className="flex items-center gap-2 mb-2">
                                 <AlertCircle className="h-5 w-5 text-blue-600" />
@@ -198,53 +228,41 @@ const CodebaseParser: React.FC = () => {
                 </span>
                             </div>
                             <p className="text-blue-700">
-                                Selected: {selectedFiles.size} files | Size:{' '}
-                                {formatFileSize(getSelectedSize())} / {formatFileSize(MAX_SIZE)}
+                                Selected: {selectedFiles.size} files&nbsp;|&nbsp;Size:{' '}
+                                {formatFileSize(getSelectedSize())} /{' '}
+                                {formatFileSize(MAX_EXPORT_SIZE)}
                             </p>
+                            {gitignoreApplied && (
+                                <p className="text-xs text-blue-600 mt-1">
+                                    .gitignore rules were applied automatically
+                                </p>
+                            )}
                         </div>
 
                         <div className="max-h-96 overflow-y-auto border rounded-lg">
-                            {files.map((f) => {
-                                const isSel = selectedFiles.has(f.path);
-                                const parts = f.path.split('/');
-                                const fileName = parts.pop() ?? f.path;
-                                const dir = parts.join('/');
-                                return (
-                                    <div
-                                        key={f.path}
-                                        className={`flex items-center p-3 border-b hover:bg-gray-50 ${
-                                            isSel ? 'bg-blue-50' : ''
-                                        }`}
-                                    >
-                                        <input
-                                            type="checkbox"
-                                            className="mr-3 h-4 w-4 text-blue-600"
-                                            checked={isSel}
-                                            onChange={() => toggleFile(f.path)}
-                                        />
-                                        <File className="h-4 w-4 text-gray-500 mr-2" />
-                                        <div className="flex-1 min-w-0">
-                                            <div className="flex items-center gap-2">
-                        <span className="font-medium text-gray-900">
-                          {fileName}
-                        </span>
-                                                <span className="text-xs text-gray-500">
-                          ({formatFileSize(f.size)})
-                        </span>
-                                            </div>
-                                            {dir && (
-                                                <div className="text-sm text-gray-500">{dir}</div>
-                                            )}
-                                        </div>
-                                    </div>
-                                );
-                            })}
+                            <FileTree
+                                nodes={tree}
+                                selected={selectedFiles}
+                                onToggleFile={toggleFile}
+                                onToggleFolder={toggleFolder}
+                            />
                         </div>
+
+                        {/* Error if over 50 MB */}
+                        {exportTooLarge && (
+                            <div className="mt-4 p-3 bg-red-50 text-red-700 rounded-lg flex items-center gap-2">
+                                <AlertCircle className="h-5 w-5" />
+                                Selected files exceed the 50 MB export limit. Trim your
+                                selection or update .gitignore.
+                            </div>
+                        )}
 
                         <div className="mt-6 text-center">
                             <button
                                 onClick={generateDocuments}
-                                disabled={isProcessing || selectedFiles.size === 0}
+                                disabled={
+                                    isProcessing || selectedFiles.size === 0 || exportTooLarge
+                                }
                                 className="inline-flex items-center px-8 py-3 bg-indigo-600 text-white font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                             >
                                 {isProcessing ? (
@@ -258,7 +276,7 @@ const CodebaseParser: React.FC = () => {
                     </section>
                 )}
 
-                {/* ───── Results ───── */}
+                {/* ─────────── Results ─────────── */}
                 {txtBlob && pdfBlob && (
                     <section className="bg-white rounded-xl shadow-lg p-8">
                         <header className="flex justify-between items-center mb-6">
